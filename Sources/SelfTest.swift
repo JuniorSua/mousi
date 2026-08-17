@@ -76,6 +76,25 @@ enum SelfTest {
             check("Drag-select shows the pill", false, "could not locate the text area")
         }
 
+        // 6) The ⋯ menu is how most actions are reached — make sure it opens from a
+        //    non-activating panel, which is not a given.
+        let pill = PillController()
+        pill.show(text: original, at: NSPoint(x: 600, y: 500))
+        pill.layout(animated: false)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        if let frame = pillFrame(ownedBy: ProcessInfo.processInfo.processIdentifier) {
+            // ⋯ sits at the trailing edge, inside the 12pt shadow padding.
+            let target = CGPoint(x: frame.maxX - 26, y: frame.midY)
+            click(at: target)
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            check("⋯ menu opens", menuIsOpen())
+            KeySender.sendPlain(keyCode: 53) // esc
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        } else {
+            check("⋯ menu opens", false, "pill window not found")
+        }
+        pill.hide()
+
         print("\n\(pass) passed, \(fail) failed")
         NSApp.terminate(nil)
     }
@@ -112,6 +131,34 @@ enum SelfTest {
             usleep(25_000)
         }
         CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: to, mouseButton: .left)?.post(tap: .cghidEventTap)
+    }
+
+    private static func pillFrame(ownedBy pid: Int32) -> CGRect? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return nil }
+        for w in list where (w[kCGWindowOwnerPID as String] as? Int).map({ $0 == Int(pid) }) ?? false {
+            guard let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  let width = b["Width"], width > 100, width < 500 else { continue }
+            return CGRect(x: b["X"]!, y: b["Y"]!, width: width, height: b["Height"]!)
+        }
+        return nil
+    }
+
+    private static func click(at p: CGPoint) {
+        let src = CGEventSource(stateID: .combinedSessionState)
+        CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(120_000)
+        CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(60_000)
+        CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+    }
+
+    /// An open NSMenu shows up as a separate high-layer window.
+    private static func menuIsOpen() -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return false }
+        return list.contains { w in
+            (w[kCGWindowOwnerPID as String] as? Int).map { $0 == Int(ProcessInfo.processInfo.processIdentifier) } ?? false
+                && ((w[kCGWindowLayer as String] as? Int) ?? 0) >= 100
+        }
     }
 
     /// Looks for the running Mousi's floating pill (its own panel sits at window layer 24/25).

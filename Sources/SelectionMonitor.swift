@@ -20,6 +20,9 @@ enum KeySender {
         up.post(tap: .cghidEventTap)
     }
 
+    /// Same as `send` but without the ⌘ modifier, for plain keys like esc.
+    static func sendPlain(keyCode: CGKeyCode) { send(keyCode: keyCode, command: false) }
+
     static let keyC: CGKeyCode = 8
     static let keyV: CGKeyCode = 9
 
