@@ -11,6 +11,34 @@ enum SelfTest {
     private static let replacement = "He and I went to the store yesterday, but it was closed."
     private static let path = "/tmp/mousi-selftest.txt"
 
+    /// MOUSI_DEBUG_AXPROBE=1: after a short delay, describe the focused element of the
+    /// frontmost app and how far our replace path would get with it. Focus a text field in
+    /// the app you're curious about during the delay.
+    static func probe() async {
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        let app = NSWorkspace.shared.frontmostApplication
+        print("frontmost:", app?.localizedName ?? "?", "bundle:", app?.bundleIdentifier ?? "?")
+        guard let sel = Accessibility.selection() ?? Accessibility.currentTarget().map({ ("", $0) }) else {
+            print("no focused element / no selection"); NSApp.terminate(nil); return
+        }
+        let el = sel.1.element
+        func attr(_ n: String) -> String { var r: CFTypeRef?; AXUIElementCopyAttributeValue(el, n as CFString, &r); return r.map { String("\($0)".prefix(80)) } ?? "nil" }
+        func settable(_ n: String) -> Bool { var s: DarwinBoolean = false; return AXUIElementIsAttributeSettable(el, n as CFString, &s) == .success && s.boolValue }
+        print("selectedText via AX:", sel.0.isEmpty ? "(none)" : "\"\(sel.0.prefix(60))\"")
+        print("role:", attr(kAXRoleAttribute), "| subrole:", attr(kAXSubroleAttribute))
+        print("AXSelectedText settable:", settable(kAXSelectedTextAttribute))
+        print("AXValue settable:", settable(kAXValueAttribute))
+        print("wasEditable (our gate):", sel.1.wasEditable)
+        if ProcessInfo.processInfo.environment["MOUSI_DEBUG_AXPROBE"] == "write" {
+            let ok = Accessibility.replaceSelection(with: "REPLACED-BY-PROBE", in: sel.1)
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            print("AX write returned:", ok)
+            print("selectedText after write:", Accessibility.selectedText().map { "\"\($0.prefix(60))\"" } ?? "(none)")
+            print("value after write:", attr(kAXValueAttribute))
+        }
+        NSApp.terminate(nil)
+    }
+
     static func run() async {
         var pass = 0, fail = 0
         func check(_ name: String, _ ok: Bool, _ detail: String = "") {
@@ -140,11 +168,22 @@ enum SelfTest {
         pill.hide()
 
         // 7) A ⋯ menu action must replace too — menu items are a different path to perform().
+        NSApp.hide(nil)                       // our own pill/menu must not hold focus
         try? await Task.sleep(nanoseconds: 400_000_000)
-        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit").first?
-            .activate(options: [.activateAllWindows])
-        try? await Task.sleep(nanoseconds: 900_000_000)
-        if let el = firstFocusedElement(), let rect = frame(of: el) {
+        var textArea: AXUIElement?
+        if let te = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit").first {
+            te.activate(options: [.activateAllWindows])
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            // Find the document's text view in TextEdit's own tree and click into it, so the
+            // focus is unambiguous regardless of what the previous steps left behind.
+            if let ta = search(AXUIElementCreateApplication(te.processIdentifier), title: "", depth: 0, role: "AXTextArea"),
+               let r = frame(of: ta) {
+                click(at: CGPoint(x: r.minX + 20, y: r.minY + 12))
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                textArea = ta
+            }
+        }
+        if let el = textArea, let rect = frame(of: el) {
             drag(from: CGPoint(x: rect.minX + 12, y: rect.minY + 10),
                  to: CGPoint(x: rect.minX + 300, y: rect.minY + 10))
             try? await Task.sleep(nanoseconds: 1_800_000_000)
@@ -173,11 +212,81 @@ enum SelfTest {
                 check("⋯ menu action (Shorten) replaces the text", false, "pill window not found")
             }
         } else {
-            check("⋯ menu action (Shorten) replaces the text", false, "TextEdit text area not focused")
+            let fm = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+            let role = firstFocusedElement().map(roleOf) ?? "nil"
+            check("⋯ menu action (Shorten) replaces the text", false, "TextEdit text area not focused (front: \(fm), focused role: \(role))")
         }
+
+        // 8) The same click-to-replace flow in a Chromium browser, where the direct AX write
+        //    is silently ignored and the paste path has to carry it. This is the case that
+        //    was broken in the field.
+        await browserCheck(&pass, &fail)
 
         print("\n\(pass) passed, \(fail) failed")
         NSApp.terminate(nil)
+    }
+
+    private static let braveID = "com.brave.Browser"
+
+    private static func browserCheck(_ pass: inout Int, _ fail: inout Int) async {
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print("\(ok ? "PASS" : "FAIL")  \(name)\(detail.isEmpty ? "" : "  — \(detail)")")
+            ok ? (pass += 1) : (fail += 1)
+        }
+        guard let brave = NSWorkspace.shared.urlForApplication(withBundleIdentifier: braveID) else {
+            print("SKIP  Brave not installed — browser check skipped"); return
+        }
+        let html = """
+        <html><body style="font:16px sans-serif;padding:40px">
+        <textarea id="t" rows="4" cols="70">\(original)</textarea>
+        <script>const t=document.getElementById('t');t.focus();t.select();</script></body></html>
+        """
+        let page = "/tmp/mousi-selftest.html"
+        try? html.write(toFile: page, atomically: true, encoding: .utf8)
+        let cfg = NSWorkspace.OpenConfiguration(); cfg.activates = true
+        _ = try? await NSWorkspace.shared.open([URL(fileURLWithPath: page)], withApplicationAt: brave, configuration: cfg)
+        var front = false
+        for _ in 0..<15 {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == braveID { front = true; break }
+        }
+        check("Brave frontmost", front, NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")
+        guard front else { return }
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+
+        // Select all in the textarea, then drag-select the visible line to trigger the pill.
+        KeySender.send(keyCode: 0, command: true)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        guard let el = firstFocusedElement(), let rect = frame(of: el) else {
+            check("Brave: locate textarea", false); return
+        }
+        print("      textarea frame: \(rect)  role: \(roleOf(el))")
+        // Click into the field first so the browser has keyboard focus there, then drag.
+        click(at: CGPoint(x: rect.minX + 6, y: rect.minY + 12))
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        drag(from: CGPoint(x: rect.minX + 6, y: rect.minY + 12), to: CGPoint(x: rect.minX + min(rect.width - 6, 420), y: rect.minY + 12))
+        var shown = false
+        for _ in 0..<12 { try? await Task.sleep(nanoseconds: 250_000_000); if pillIsOnScreen() { shown = true; break } }
+        if !shown {
+            print("      no pill; AX selection now: \(Accessibility.selectedText().map { "\"\($0.prefix(50))\"" } ?? "nil")")
+        }
+        check("Brave: drag-select shows the pill", shown)
+
+        let before = documentText() ?? ""
+        let mePid = ProcessInfo.processInfo.processIdentifier
+        guard let button = findButton(titled: "Professional", inPidOtherThan: mePid), let bRect = frame(of: button) else {
+            check("Brave: clicking Professional replaces the text", false, "Professional button not found"); return
+        }
+        click(at: CGPoint(x: bRect.midX, y: bRect.midY))
+        var changed = false
+        for _ in 0..<40 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if let now = documentText(), now != before, !now.isEmpty { changed = true; break }
+        }
+        let after = documentText() ?? ""
+        check("Brave: clicking Professional replaces the text", changed,
+              changed ? "\"\(after.prefix(60))…\"" : "textarea unchanged — result was not written back")
+        check("Brave: original text is gone", changed && !after.contains("me and him was going"))
     }
 
     /// TextEdit applies smart quotes and dashes, so compare on the plain forms.
@@ -186,6 +295,10 @@ enum SelfTest {
          .replacingOccurrences(of: "\u{201C}", with: "\"")
          .replacingOccurrences(of: "\u{201D}", with: "\"")
          .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func roleOf(_ el: AXUIElement) -> String {
+        var r: CFTypeRef?; AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &r); return (r as? String) ?? "?"
     }
 
     // MARK: helpers
@@ -229,7 +342,7 @@ enum SelfTest {
         AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &titleRef)
         AXUIElementCopyAttributeValue(el, kAXDescriptionAttribute as CFString, &descRef)
         let label = (titleRef as? String) ?? (descRef as? String) ?? ""
-        if (roleRef as? String) == wanted, label.localizedCaseInsensitiveContains(title) { return el }
+        if (roleRef as? String) == wanted, title.isEmpty || label.localizedCaseInsensitiveContains(title) { return el }
         var kidsRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
               let kids = kidsRef as? [AXUIElement] else { return nil }

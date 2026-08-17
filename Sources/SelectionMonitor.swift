@@ -1,11 +1,11 @@
 import AppKit
 import ApplicationServices
 
-/// Marker stamped on keyboard events Mousi synthesizes (Cmd+C / Cmd+V) so the
-/// global monitors don't mistake them for the user typing.
-private let syntheticMarker: Int64 = 0x4D4F5553 // "MOUS"
-
 enum KeySender {
+    /// Marker stamped on keyboard events Mousi synthesizes (Cmd+C / Cmd+V) so the
+    /// global monitors don't mistake them for the user typing.
+    static let syntheticMarker: Int64 = 0x4D4F5553 // "MOUS"
+
     static func send(keyCode: CGKeyCode, command: Bool) {
         let src = CGEventSource(stateID: .combinedSessionState)
         guard let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
@@ -40,6 +40,14 @@ struct SelectionTarget {
     let wasEditable: Bool
 
     var app: NSRunningApplication? { NSRunningApplication(processIdentifier: pid) }
+
+    /// True only for elements that are unambiguously read-only display text.
+    var isStaticText: Bool {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &ref) == .success,
+              let role = ref as? String else { return false }
+        return role == "AXStaticText" || role == "AXImage" || role == "AXLink"
+    }
 
     /// Bring the owning app back to the front so a synthetic paste lands in it.
     @discardableResult
@@ -102,18 +110,7 @@ enum Accessibility {
     }
 
     /// Whether the focused element looks like somewhere a paste would land.
-    static func focusedIsEditable() -> Bool {
-        let editableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
-        for el in focusedElements() {
-            var roleRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef) == .success,
-               let role = roleRef as? String, editableRoles.contains(role) { return true }
-            var settable: DarwinBoolean = false
-            if AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable) == .success,
-               settable.boolValue { return true }
-        }
-        return false
-    }
+    static func focusedIsEditable() -> Bool { focusedElements().contains(where: isEditable) }
 
     /// Reads the currently selected text from the focused UI element via the Accessibility API.
     static func selectedText() -> String? { selection()?.text }
@@ -146,7 +143,7 @@ enum Accessibility {
         return SelectionTarget(element: el, pid: elPid != 0 ? elPid : pid, wasEditable: isEditable(el))
     }
 
-    private static func isEditable(_ el: AXUIElement) -> Bool {
+    static func isEditable(_ el: AXUIElement) -> Bool {
         let editableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
         var roleRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef) == .success,
@@ -156,13 +153,48 @@ enum Accessibility {
             && settable.boolValue
     }
 
-    /// Write over the selection in the element it came from.
+    /// Write over the selection in the element it came from — and confirm it actually happened.
+    ///
+    /// Chromium apps (Brave, Chrome, Electron) report the attribute as settable and return
+    /// success from the write while changing nothing. Trusting the return value is exactly the
+    /// bug that made actions "do nothing" in the browser, so this reads back and only returns
+    /// true when the element's contents visibly changed.
     static func replaceSelection(with text: String, in target: SelectionTarget) -> Bool {
         var settable: DarwinBoolean = false
         guard AXUIElementIsAttributeSettable(target.element, kAXSelectedTextAttribute as CFString, &settable) == .success,
               settable.boolValue else { return false }
-        return AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString,
-                                            text as CFTypeRef) == .success
+
+        let valueBefore = stringAttr(target.element, kAXValueAttribute)
+        let selectionBefore = stringAttr(target.element, kAXSelectedTextAttribute)
+        guard AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString,
+                                           text as CFTypeRef) == .success else { return false }
+
+        // Read back. Give the host a moment; some apps apply the edit on their next runloop turn.
+        for _ in 0..<6 {
+            let valueAfter = stringAttr(target.element, kAXValueAttribute)
+            let selectionAfter = stringAttr(target.element, kAXSelectedTextAttribute)
+            if let vb = valueBefore, let va = valueAfter {
+                // Value readable: it changed and now carries our text (allow for smart-quote
+                // substitution by checking a plain prefix as well).
+                if va != vb {
+                    let probe = String(text.prefix(24))
+                    return va.contains(text) || va.contains(probe)
+                }
+            } else if let sb = selectionBefore, let sa = selectionAfter, sa != sb {
+                // No readable value; the selection collapsing or becoming the new text is our signal.
+                return sa.isEmpty || sa == text
+            } else if valueBefore == nil, selectionBefore == nil {
+                return true // nothing observable to check; trust the write
+            }
+            usleep(50_000)
+        }
+        return false
+    }
+
+    private static func stringAttr(_ el: AXUIElement, _ name: String) -> String? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, name as CFString, &ref) == .success else { return nil }
+        return ref as? String
     }
 }
 
@@ -212,7 +244,9 @@ enum Clipboard {
     /// Reports whether the paste was actually attempted.
     static func pasteIfPossible(_ s: String, into target: SelectionTarget?) async -> Bool {
         if let target {
-            guard target.wasEditable else { return false }
+            // Only refuse for things we positively know are static text; web fields, custom
+            // editors and Electron apps often fail the "looks editable" heuristics yet paste fine.
+            if target.isStaticText { return false }
             await target.reactivate()
         } else {
             guard Accessibility.focusedIsEditable() else { return false }
