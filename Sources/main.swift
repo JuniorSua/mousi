@@ -11,15 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Debug hook: render the pill states to PNGs and quit (used by build.sh to verify the UI).
-        if let dir = ProcessInfo.processInfo.environment["MOUSI_DEBUG_RENDER"] {
-            Task { @MainActor in
-                await PillController.debugRender(to: URL(fileURLWithPath: dir))
-                NSApp.terminate(nil)
-            }
-            return
-        }
-
         pill = PillController()
         setupStatusItem()
 

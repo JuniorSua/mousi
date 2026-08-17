@@ -25,9 +25,16 @@ echo -n "APPL????" > "$APP/Contents/PkgInfo"
 # Tools/make-signing-identity.sh) so macOS keeps the Accessibility grant across rebuilds.
 # Ad-hoc signatures change every build and silently invalidate it.
 KC=~/Library/Keychains/mousi-dev.keychain-db
+PWFILE="$HOME/Library/Application Support/Mousi/signing-keychain.pw"
 if [[ -f "$KC" ]] && security find-identity -v -p codesigning "$KC" 2>/dev/null | grep -q '"Mousi Dev"'; then
   echo "▸ Signing (Mousi Dev)…"
-  codesign --force --deep --sign "Mousi Dev" --keychain "$KC" "$APP"
+  # Unlock first — a locked keychain makes codesign pop a password dialog mid-build.
+  [[ -f "$PWFILE" ]] && security unlock-keychain -p "$(cat "$PWFILE")" "$KC" 2>/dev/null
+  security set-keychain-settings "$KC" 2>/dev/null   # no auto-lock, no lock on sleep
+  if ! codesign --force --deep --sign "Mousi Dev" --keychain "$KC" "$APP" 2>/dev/null; then
+    echo "  (Mousi Dev signing failed — falling back to ad-hoc; re-run Tools/make-signing-identity.sh to restore it)"
+    codesign --force --deep --sign - "$APP" 2>/dev/null
+  fi
 else
   echo "▸ Signing (ad-hoc — no 'Mousi Dev' identity found)…"
   codesign --force --deep --sign - "$APP" 2>/dev/null

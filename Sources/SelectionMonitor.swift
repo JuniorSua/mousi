@@ -42,8 +42,8 @@ enum Accessibility {
         NSWorkspace.shared.open(url)
     }
 
-    /// Reads the currently selected text from the focused UI element via the Accessibility API.
-    static func selectedText() -> String? {
+    /// The focused UI elements worth asking about the selection, best candidate first.
+    private static func focusedElements() -> [AXUIElement] {
         var candidates: [AXUIElement] = []
         let systemWide = AXUIElementCreateSystemWide()
         var focusedRef: CFTypeRef?
@@ -58,7 +58,40 @@ enum Accessibility {
                 candidates.append(f as! AXUIElement)
             }
         }
-        for el in candidates {
+        return candidates
+    }
+
+    /// Writes `text` over the current selection directly through the Accessibility API.
+    /// Instant when it works, leaves the clipboard untouched, and stays in the app's undo stack.
+    static func replaceSelection(with text: String) -> Bool {
+        for el in focusedElements() {
+            var settable: DarwinBoolean = false
+            guard AXUIElementIsAttributeSettable(el, kAXSelectedTextAttribute as CFString, &settable) == .success,
+                  settable.boolValue else { continue }
+            if AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Whether the focused element looks like somewhere a paste would land.
+    static func focusedIsEditable() -> Bool {
+        let editableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+        for el in focusedElements() {
+            var roleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef) == .success,
+               let role = roleRef as? String, editableRoles.contains(role) { return true }
+            var settable: DarwinBoolean = false
+            if AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable) == .success,
+               settable.boolValue { return true }
+        }
+        return false
+    }
+
+    /// Reads the currently selected text from the focused UI element via the Accessibility API.
+    static func selectedText() -> String? {
+        for el in focusedElements() {
             var textRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(el, kAXSelectedTextAttribute as CFString, &textRef) == .success,
                let s = textRef as? String,
@@ -110,6 +143,13 @@ enum Clipboard {
         if changed { restore(saved) }
         guard let t = text, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return t
+    }
+
+    /// Paste only where a paste can actually land; reports whether it was attempted.
+    static func pasteIfPossible(_ s: String) async -> Bool {
+        guard Accessibility.focusedIsEditable() else { return false }
+        await paste(s)
+        return true
     }
 
     /// Put `s` on the clipboard and paste it into the frontmost app, then restore the clipboard.

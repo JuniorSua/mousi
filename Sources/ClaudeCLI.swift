@@ -51,7 +51,9 @@ enum ClaudeCLI {
     static func run(prompt: String, systemPrompt: String?, jsonSchema: [String: Any]?, model: String) async throws -> Output {
         guard let bin = locate() else { throw ClaudeError.cliMissing }
         var args = ["-p", "--output-format", "json", "--no-session-persistence",
-                    "--tools", "", "--setting-sources", "", "--model", model, "--effort", "low"]
+                    "--tools", "", "--setting-sources", "", "--model", model, "--effort", "low",
+                    // Skips the CLI's dynamic system-prompt sections we don't need — ~0.2s per call.
+                    "--exclude-dynamic-system-prompt-sections"]
         if let s = systemPrompt { args += ["--system-prompt", s] }
         if let schema = jsonSchema,
            let data = try? JSONSerialization.data(withJSONObject: schema),
@@ -108,22 +110,14 @@ enum ClaudeCLI {
         }
     }
 
-    /// Runs a structured task and returns the raw JSON payload matching its schema.
-    static func structured(_ task: ClaudeTask, text: String, model: String) async throws -> Data {
-        let out = try await run(prompt: text, systemPrompt: task.system, jsonSchema: task.schema, model: alias(for: model))
+    /// Runs one plain-text request and returns the model's text.
+    static func run(system: String, text: String, model: String) async throws -> String {
+        let out = try await run(prompt: text, systemPrompt: system, jsonSchema: nil, model: alias(for: model))
         if out.isError {
             if out.result.lowercased().contains("not logged in") { throw ClaudeError.cliNotLoggedIn }
             throw ClaudeError.http(0, out.result.isEmpty ? "Claude CLI error" : out.result)
         }
-        if let s = out.structured, let d = try? JSONSerialization.data(withJSONObject: s) { return d }
-        guard let d = out.result.data(using: .utf8), !d.isEmpty else { throw ClaudeError.badResponse }
-        if (try? JSONSerialization.jsonObject(with: d)) != nil { return d }
-        // The model answered in plain text; if the schema has a single string field, wrap it.
-        if let props = task.schema["properties"] as? [String: Any], props.count == 1, let key = props.keys.first,
-           let wrapped = try? JSONSerialization.data(withJSONObject: [key: out.result]) {
-            return wrapped
-        }
-        throw ClaudeError.badResponse
+        return out.result
     }
 
     static func test() async -> Result<Void, ClaudeError> {
