@@ -84,6 +84,20 @@ A few of the interesting problems solved along the way:
 - **Cheap and fast AI.** Rewrites run on Haiku with thinking capped, via the CLI the user is already logged into — no keys to manage, roughly a fraction of a cent per use. Asking for one plain‑text result instead of three JSON ones cut latency ~40%.
 - **Making a small model obey a length limit.** "Keep it about twice the length" is ignored; the app counts the words in your selection and states an exact cap in the prompt. That alone took prompt‑enhancement bloat from 4.6× the original down to 2.0×.
 
+## Verifying a build
+
+`Sources/SelfTest.swift` drives a real app end to end — it opens a scratch TextEdit document and checks
+Accessibility trust, selection reading, editable-target detection, in-place replacement, that the
+clipboard is left alone, that ⌘Z restores the original, and that a genuine mouse drag makes the pill appear:
+
+```sh
+open -a /Applications/Mousi.app --env MOUSI_DEBUG_SELFTEST=1 \
+  --stdout /tmp/selftest.log --new --wait-apps && cat /tmp/selftest.log
+```
+
+Launch it through `open` rather than running the binary directly, or macOS won't recognise the
+Accessibility grant and every check fails at the first step.
+
 ## Privacy
 
 Mousi only reads text when you actively highlight it, and only sends it anywhere when you click one of the AI actions — Copy never leaves your Mac. Nothing is logged or stored by the app. Your API key (if you use one) lives in the app's local preferences on your Mac.

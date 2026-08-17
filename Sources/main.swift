@@ -11,6 +11,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // End-to-end self-test against a real app (see SelfTest.swift).
+        if ProcessInfo.processInfo.environment["MOUSI_DEBUG_SELFTEST"] != nil {
+            Task { @MainActor in await SelfTest.run() }
+            return
+        }
+
         pill = PillController()
         setupStatusItem()
 
