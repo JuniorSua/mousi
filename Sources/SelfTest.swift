@@ -31,14 +31,34 @@ enum SelfTest {
         if let te = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit") {
             _ = try? await NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: te, configuration: cfg)
         }
-        try? await Task.sleep(nanoseconds: 2_500_000_000)
-        check("TextEdit frontmost", NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.TextEdit",
-              NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")
+        // Wait for TextEdit to genuinely own the front, retrying activation. Everything after this
+        // point types and replaces text through synthetic events, so if it ran against the wrong
+        // app it would edit the user's real documents. Refuse to continue rather than risk that.
+        var frontmost = false
+        for attempt in 0..<15 {
+            if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.TextEdit" { frontmost = true; break }
+            if attempt % 5 == 4 {
+                NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit").first?
+                    .activate(options: [.activateAllWindows])
+            }
+            try? await Task.sleep(nanoseconds: 400_000_000)
+        }
+        check("TextEdit frontmost", frontmost, NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")
+        guard frontmost else {
+            print("\nABORTED: TextEdit never came to the front, so the remaining checks would have")
+            print("typed into whatever app was in front instead. Nothing was modified.")
+            print("\n\(pass) passed, \(fail) failed (aborted early)")
+            NSApp.terminate(nil); return
+        }
 
         // 1) Selection reading — select all, then read it back through the same code path the pill uses.
-        KeySender.send(keyCode: 0, command: true)  // ⌘A
-        try? await Task.sleep(nanoseconds: 600_000_000)
-        let read = Accessibility.selectedText()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var read: String?
+        for _ in 0..<8 {
+            KeySender.send(keyCode: 0, command: true)  // ⌘A
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            read = Accessibility.selectedText()?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if read?.isEmpty == false { break }
+        }
         check("Reads selection via AX", read == original, read.map { "got \"\($0.prefix(40))…\"" } ?? "got nil")
 
         // 2) Editability probe used to decide replace-vs-copy.
@@ -65,13 +85,37 @@ enum SelfTest {
         let undone = Accessibility.selectedText()?.trimmingCharacters(in: .whitespacesAndNewlines)
         check("⌘Z restores the original", undone == original, undone.map { "\"\($0.prefix(50))…\"" } ?? "nil")
 
-        // 5) A real drag selection should make the already-running Mousi show its pill.
+        // 5) The whole real path: drag-select, the running Mousi shows its pill, click
+        //    Professional, and the document text must actually change. This is the flow that
+        //    matters — checking replaceSelection() in isolation passes even when it's broken,
+        //    because in isolation nothing has stolen focus from the text field.
         if let el = firstFocusedElement(), let rect = frame(of: el) {
-            let from = CGPoint(x: rect.minX + 12, y: rect.minY + 10)
-            let to = CGPoint(x: rect.minX + 260, y: rect.minY + 10)
-            drag(from: from, to: to)
-            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            drag(from: CGPoint(x: rect.minX + 12, y: rect.minY + 10),
+                 to: CGPoint(x: rect.minX + 300, y: rect.minY + 10))
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
             check("Drag-select shows the pill", pillIsOnScreen())
+
+            let before = documentText()
+            let clipAtClick = NSPasteboard.general.changeCount
+            if let button = findButton(titled: "Professional", inPidOtherThan: ProcessInfo.processInfo.processIdentifier),
+               let bRect = frame(of: button) {
+                click(at: CGPoint(x: bRect.midX, y: bRect.midY))
+                var changed = false
+                for _ in 0..<40 {                       // up to 20s for the model round trip
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    if let now = documentText(), let before, now != before { changed = true; break }
+                }
+                let after = documentText() ?? ""
+                check("Clicking Professional REPLACES the text in the document", changed,
+                      changed ? "\"\(after.prefix(60))…\"" : "document unchanged — result was not written back")
+                // The whole point of the fix: it must go in through the Accessibility API,
+                // not degrade to putting the text on the clipboard.
+                check("Replaced without touching the clipboard",
+                      changed && NSPasteboard.general.changeCount == clipAtClick,
+                      NSPasteboard.general.changeCount == clipAtClick ? "" : "clipboard was used — it fell back to copy")
+            } else {
+                check("Clicking Professional REPLACES the text", false, "could not find the Professional button")
+            }
         } else {
             check("Drag-select shows the pill", false, "could not locate the text area")
         }
@@ -95,11 +139,103 @@ enum SelfTest {
         }
         pill.hide()
 
+        // 7) A ⋯ menu action must replace too — menu items are a different path to perform().
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit").first?
+            .activate(options: [.activateAllWindows])
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        if let el = firstFocusedElement(), let rect = frame(of: el) {
+            drag(from: CGPoint(x: rect.minX + 12, y: rect.minY + 10),
+                 to: CGPoint(x: rect.minX + 300, y: rect.minY + 10))
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            let mePid = ProcessInfo.processInfo.processIdentifier
+            let otherPid = NSWorkspace.shared.runningApplications
+                .first { $0.localizedName == "Mousi" && $0.processIdentifier != mePid }?.processIdentifier
+            // SwiftUI's Menu isn't an AXButton, so aim at the trailing edge of the pill instead.
+            if let otherPid, let pRect = pillFrame(ownedBy: otherPid) {
+                let before = documentText()
+                click(at: CGPoint(x: pRect.maxX - 26, y: pRect.midY))
+                try? await Task.sleep(nanoseconds: 900_000_000)
+                if let item = findMenuItem(titled: "Shorten", inPidOtherThan: mePid) {
+                    AXUIElementPerformAction(item, kAXPressAction as CFString)
+                    var changed = false
+                    for _ in 0..<40 {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        if let now = documentText(), let before, now != before { changed = true; break }
+                    }
+                    check("⋯ menu action (Shorten) replaces the text", changed,
+                          changed ? "\"\((documentText() ?? "").prefix(60))…\"" : "document unchanged")
+                } else {
+                    check("⋯ menu action (Shorten) replaces the text", false, "menu item not found")
+                    KeySender.sendPlain(keyCode: 53)
+                }
+            } else {
+                check("⋯ menu action (Shorten) replaces the text", false, "pill window not found")
+            }
+        } else {
+            check("⋯ menu action (Shorten) replaces the text", false, "TextEdit text area not focused")
+        }
+
         print("\n\(pass) passed, \(fail) failed")
         NSApp.terminate(nil)
     }
 
+    /// TextEdit applies smart quotes and dashes, so compare on the plain forms.
+    private static func normalise(_ s: String) -> String {
+        s.replacingOccurrences(of: "\u{2019}", with: "'")
+         .replacingOccurrences(of: "\u{201C}", with: "\"")
+         .replacingOccurrences(of: "\u{201D}", with: "\"")
+         .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: helpers
+
+    /// Whole contents of the frontmost text area.
+    private static func documentText() -> String? {
+        guard let el = firstFocusedElement() else { return nil }
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &ref) == .success else { return nil }
+        return ref as? String
+    }
+
+    /// Finds a button by title anywhere in another process's accessibility tree.
+    private static func findButton(titled title: String, inPidOtherThan me: pid_t) -> AXUIElement? {
+        let others = NSWorkspace.shared.runningApplications.filter {
+            $0.localizedName == "Mousi" && $0.processIdentifier != me
+        }
+        for app in others {
+            let root = AXUIElementCreateApplication(app.processIdentifier)
+            if let hit = search(root, title: title, depth: 0) { return hit }
+        }
+        return nil
+    }
+
+    private static func findMenuItem(titled title: String, inPidOtherThan me: pid_t) -> AXUIElement? {
+        for app in NSWorkspace.shared.runningApplications where app.localizedName == "Mousi" && app.processIdentifier != me {
+            if let hit = search(AXUIElementCreateApplication(app.processIdentifier), title: title,
+                                depth: 0, role: "AXMenuItem") { return hit }
+        }
+        return nil
+    }
+
+    private static func search(_ el: AXUIElement, title: String, depth: Int) -> AXUIElement? {
+        search(el, title: title, depth: depth, role: "AXButton")
+    }
+
+    private static func search(_ el: AXUIElement, title: String, depth: Int, role wanted: String) -> AXUIElement? {
+        if depth > 12 { return nil }
+        var roleRef: CFTypeRef?, titleRef: CFTypeRef?, descRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
+        AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &titleRef)
+        AXUIElementCopyAttributeValue(el, kAXDescriptionAttribute as CFString, &descRef)
+        let label = (titleRef as? String) ?? (descRef as? String) ?? ""
+        if (roleRef as? String) == wanted, label.localizedCaseInsensitiveContains(title) { return el }
+        var kidsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+              let kids = kidsRef as? [AXUIElement] else { return nil }
+        for kid in kids { if let hit = search(kid, title: title, depth: depth + 1, role: wanted) { return hit } }
+        return nil
+    }
 
     private static func firstFocusedElement() -> AXUIElement? {
         var ref: CFTypeRef?

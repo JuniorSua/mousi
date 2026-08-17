@@ -31,6 +31,29 @@ enum KeySender {
     }
 }
 
+/// The exact place a selection came from, remembered while the pill is open.
+/// Re-querying "what is focused now" at apply time is wrong: by then the pill itself
+/// may hold focus, so the write lands nowhere and the result silently degrades to a copy.
+struct SelectionTarget {
+    let element: AXUIElement
+    let pid: pid_t
+    let wasEditable: Bool
+
+    var app: NSRunningApplication? { NSRunningApplication(processIdentifier: pid) }
+
+    /// Bring the owning app back to the front so a synthetic paste lands in it.
+    @discardableResult
+    func reactivate() async -> Bool {
+        guard let app, !app.isActive else { return true }
+        app.activate()
+        for _ in 0..<20 {                       // up to ~400ms
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            if app.isActive { return true }
+        }
+        return false
+    }
+}
+
 enum Accessibility {
     static var isTrusted: Bool { AXIsProcessTrusted() }
 
@@ -93,16 +116,53 @@ enum Accessibility {
     }
 
     /// Reads the currently selected text from the focused UI element via the Accessibility API.
-    static func selectedText() -> String? {
+    static func selectedText() -> String? { selection()?.text }
+
+    /// The selected text together with the element it came from, so we can write back to
+    /// that same element later even after focus has moved to the pill.
+    static func selection() -> (text: String, target: SelectionTarget)? {
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
         for el in focusedElements() {
             var textRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(el, kAXSelectedTextAttribute as CFString, &textRef) == .success,
-               let s = textRef as? String,
-               !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return s
-            }
+            guard AXUIElementCopyAttributeValue(el, kAXSelectedTextAttribute as CFString, &textRef) == .success,
+                  let s = textRef as? String,
+                  !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            var settable: DarwinBoolean = false
+            AXUIElementIsAttributeSettable(el, kAXSelectedTextAttribute as CFString, &settable)
+            var elPid: pid_t = 0
+            AXUIElementGetPid(el, &elPid)
+            return (s, SelectionTarget(element: el, pid: elPid != 0 ? elPid : pid,
+                                       wasEditable: settable.boolValue || isEditable(el)))
         }
         return nil
+    }
+
+    /// The target for a selection we could only read through the clipboard (web/Electron apps).
+    static func currentTarget() -> SelectionTarget? {
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        guard let el = focusedElements().first else { return nil }
+        var elPid: pid_t = 0
+        AXUIElementGetPid(el, &elPid)
+        return SelectionTarget(element: el, pid: elPid != 0 ? elPid : pid, wasEditable: isEditable(el))
+    }
+
+    private static func isEditable(_ el: AXUIElement) -> Bool {
+        let editableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String, editableRoles.contains(role) { return true }
+        var settable: DarwinBoolean = false
+        return AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable) == .success
+            && settable.boolValue
+    }
+
+    /// Write over the selection in the element it came from.
+    static func replaceSelection(with text: String, in target: SelectionTarget) -> Bool {
+        var settable: DarwinBoolean = false
+        guard AXUIElementIsAttributeSettable(target.element, kAXSelectedTextAttribute as CFString, &settable) == .success,
+              settable.boolValue else { return false }
+        return AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString,
+                                            text as CFTypeRef) == .success
     }
 }
 
@@ -148,9 +208,15 @@ enum Clipboard {
         return t
     }
 
-    /// Paste only where a paste can actually land; reports whether it was attempted.
-    static func pasteIfPossible(_ s: String) async -> Bool {
-        guard Accessibility.focusedIsEditable() else { return false }
+    /// Paste into the app the selection came from, bringing it back to the front first.
+    /// Reports whether the paste was actually attempted.
+    static func pasteIfPossible(_ s: String, into target: SelectionTarget?) async -> Bool {
+        if let target {
+            guard target.wasEditable else { return false }
+            await target.reactivate()
+        } else {
+            guard Accessibility.focusedIsEditable() else { return false }
+        }
         await paste(s)
         return true
     }
@@ -170,7 +236,7 @@ enum Clipboard {
 /// select text, captures the selection and reports it with the mouse position.
 @MainActor
 final class SelectionMonitor {
-    var onSelection: ((String, NSPoint) -> Void)?
+    var onSelection: ((String, NSPoint, SelectionTarget?) -> Void)?
     var onDismiss: (() -> Void)?
 
     private var monitors: [Any] = []
@@ -242,12 +308,19 @@ final class SelectionMonitor {
             // Let the host app finish updating its selection.
             try? await Task.sleep(nanoseconds: 140_000_000)
             guard let self, !Task.isCancelled, gen == self.generation else { return }
-            var text = Accessibility.selectedText()
-            if text == nil, allowClipboard, Settings.clipboardFallback {
+            var text: String?
+            var target: SelectionTarget?
+            if let found = Accessibility.selection() {
+                text = found.text
+                target = found.target
+            } else if allowClipboard, Settings.clipboardFallback {
+                // Web/Electron apps that hide the selection: read it via the clipboard, but
+                // still remember the focused element so we can write the result back there.
+                target = Accessibility.currentTarget()
                 text = await Clipboard.sniffSelection()
             }
             guard !Task.isCancelled, gen == self.generation, let t = text else { return }
-            self.onSelection?(t, point)
+            self.onSelection?(t, point, target)
         }
     }
 }

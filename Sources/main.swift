@@ -26,9 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        monitor.onSelection = { [weak self] text, point in
+        monitor.onSelection = { [weak self] text, point, target in
             guard let self, Settings.enabled else { return }
-            self.pill.show(text: text, at: point)
+            self.pill.show(text: text, at: point, target: target)
         }
         monitor.onDismiss = { [weak self] in self?.pill.hide() }
         applyEnabledState()

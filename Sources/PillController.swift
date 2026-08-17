@@ -14,6 +14,7 @@ final class PillController: ObservableObject {
     @Published var phase: Phase = .compact
 
     private(set) var text: String = ""
+    private var target: SelectionTarget?
     private let panel: NSPanel
     private let hosting: NSHostingView<PillRootView>
     private var anchorTopLeft: NSPoint = .zero
@@ -44,8 +45,9 @@ final class PillController: ObservableObject {
 
     // MARK: - Showing / hiding
 
-    func show(text: String, at mouse: NSPoint) {
+    func show(text: String, at mouse: NSPoint, target: SelectionTarget? = nil) {
         self.text = text
+        self.target = target
         workTask?.cancel()
         hideTask?.cancel()
         phase = .compact
@@ -154,8 +156,15 @@ final class PillController: ObservableObject {
     /// Write the result back over the selection. Tries the Accessibility API first (instant,
     /// leaves the clipboard alone), falls back to a paste, and copies if the field is read-only.
     private func apply(_ result: String) async -> Bool {
-        if Accessibility.replaceSelection(with: result) { return true }
-        if await Clipboard.pasteIfPossible(result) { return true }
+        // 1. Write straight into the element the text came from. Instant, keeps the
+        //    clipboard, and stays in that app's undo stack.
+        if let target, Accessibility.replaceSelection(with: result, in: target) { return true }
+        // 2. Some apps only accept the write while they're frontmost — put them back and retry.
+        if let target, await target.reactivate(),
+           Accessibility.replaceSelection(with: result, in: target) { return true }
+        // 3. Otherwise paste into that same app.
+        if await Clipboard.pasteIfPossible(result, into: target) { return true }
+        // 4. Read-only text: the best we can do is hand it over.
         Clipboard.setString(result)
         return false
     }
