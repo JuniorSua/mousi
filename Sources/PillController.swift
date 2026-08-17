@@ -41,11 +41,29 @@ final class PillController: ObservableObject {
         hosting = NSHostingView(rootView: PillRootView(controller: nil))
         panel.contentView = hosting
         hosting.rootView = PillRootView(controller: self)
+        applyAppearance()
+    }
+
+    /// Pin the panel to the system appearance.
+    ///
+    /// Left to inherit, the glass resolved differently per state — the capsule came out light
+    /// over a white page while the cards stayed dark — so the pill and its own result card
+    /// didn't look like the same app. Floating system chrome (Spotlight, Control Center,
+    /// notification banners) all follow the system setting rather than the content behind
+    /// them, so this does too, and every state now matches.
+    private func applyAppearance() {
+        if let force = ProcessInfo.processInfo.environment["MOUSI_DEBUG_APPEARANCE"] {
+            panel.appearance = NSAppearance(named: force == "dark" ? .darkAqua : .aqua)
+            return
+        }
+        let dark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle")?.lowercased() == "dark"
+        panel.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     }
 
     // MARK: - Showing / hiding
 
     func show(text: String, at mouse: NSPoint, target: SelectionTarget? = nil) {
+        applyAppearance()   // the user may have switched theme since the last selection
         self.text = text
         self.target = target
         workTask?.cancel()
@@ -193,16 +211,19 @@ final class PillController: ObservableObject {
         hideTask?.cancel()
 
         if ProcessInfo.processInfo.environment["MOUSI_DEBUG_BACKDROP"] != nil {
-            let f = panel.frame.insetBy(dx: -60, dy: -60)
+            let f = panel.frame.insetBy(dx: -140, dy: -110)
             let w = NSWindow(contentRect: f, styleMask: .borderless, backing: .buffered, defer: false)
             w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue - 1)
             w.isOpaque = true
             w.hasShadow = false
+            // MOUSI_DEBUG_BACKDROP=dark|white|1 picks the backdrop, so shadows can be judged on each.
+            let kind = ProcessInfo.processInfo.environment["MOUSI_DEBUG_BACKDROP"] ?? "1"
+            let colors: [Color] = kind == "dark"
+                ? [Color(red: 0.16, green: 0.17, blue: 0.22), Color(red: 0.10, green: 0.11, blue: 0.16)]
+                : kind == "white" ? [Color.white, Color(white: 0.96)]
+                : [Color(red: 0.93, green: 0.94, blue: 0.98), Color(red: 0.80, green: 0.86, blue: 0.98), Color(red: 0.90, green: 0.82, blue: 0.96)]
             w.contentView = NSHostingView(rootView:
-                LinearGradient(colors: [Color(red: 0.93, green: 0.94, blue: 0.98),
-                                        Color(red: 0.80, green: 0.86, blue: 0.98),
-                                        Color(red: 0.90, green: 0.82, blue: 0.96)],
-                               startPoint: .topLeading, endPoint: .bottomTrailing).ignoresSafeArea())
+                LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing).ignoresSafeArea())
             w.orderFrontRegardless()
             debugBackdrop = w
             panel.orderFrontRegardless()
