@@ -55,7 +55,7 @@ enum Actions {
         id: "prompt", label: "Enhance as AI prompt", icon: "lightbulb.max.fill",
         hint: "Rewrite this rough request as a sharper AI prompt",
         system: PromptEnhancer.systemPrompt,
-        lengthMult: 2.0, lengthFloor: 28)
+        lengthMult: 2.0, lengthFloor: 20)
 
     static let shorten = MousiAction(
         id: "shorten", label: "Shorten", icon: "arrow.down.right.and.arrow.up.left",
