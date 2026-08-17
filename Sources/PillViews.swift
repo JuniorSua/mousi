@@ -110,6 +110,7 @@ private struct CompactPill: View {
             }
             .buttonStyle(PillButtonStyle())
             .help("Copy selection")
+            .accessibilityLabel("Copy selection")
 
             Hairline()
 
@@ -147,6 +148,7 @@ private struct ActionButton: View {
                     Image(systemName: action.icon)
                         .font(UI.icon)
                         .foregroundStyle(Color.accentColor)
+                        .accessibilityHidden(true)   // the label beside it already says what this is
                 }
                 Text(action.label).font(UI.label)
             }
@@ -181,6 +183,7 @@ private struct MoreMenu: View {
         .fixedSize()
         .onHover { hovering = $0 }
         .help("More actions")
+        .accessibilityLabel("More actions")
     }
 }
 
@@ -209,6 +212,7 @@ private struct DonePill: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(UI.icon)
                 .foregroundStyle(.green)
+                .accessibilityHidden(true)
             Text(verb).font(UI.label).foregroundStyle(.primary)
         }
         .frame(height: UI.control)
@@ -226,6 +230,7 @@ private struct ErrorCard: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(UI.icon)
                 .foregroundStyle(.orange)
+                .accessibilityHidden(true)
             Text(message).font(UI.body).foregroundStyle(.primary).lineSpacing(2).lineLimit(4)
         }
         .padding(.horizontal, 12)
@@ -255,6 +260,7 @@ private struct NoteCard: View {
                 Image(systemName: isClean ? "checkmark.seal.fill" : "shield.lefthalf.filled")
                     .font(UI.icon)
                     .foregroundStyle(isClean ? .green : .orange)
+                    .accessibilityHidden(true)
                 Text(title).font(UI.title).foregroundStyle(.primary)
                 Spacer(minLength: 12)
                 Button(action: controller.hide) {
@@ -262,6 +268,7 @@ private struct NoteCard: View {
                         .frame(width: 16, height: 16)
                 }
                 .buttonStyle(PillButtonStyle())
+                .accessibilityLabel("Dismiss")
             }
             Text(body_)
                 .font(UI.body)
